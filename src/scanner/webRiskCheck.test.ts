@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import * as cheerio from 'cheerio';
 import {
   extractSubresourceUrls,
+  runGoogleSiteStatusCheck,
   runWebRiskBatchCheck,
   runWebRiskCheck,
   verifyGoogleThreatApiStatus,
@@ -438,5 +439,53 @@ test('verifyGoogleThreatApiStatus reports working, unconfigured, and error state
   assert.equal(workingFallback.working, true);
   assert.equal(workingFallback.provider, 'Google Safe Browsing API v4');
 });
+
+test('extractSubresourceUrls also extracts statically assigned .src URLs from inline scripts', () => {
+  const html = `<html><head><script>
+    function loadImage() {
+      document.getElementById('badimage').src = "bad_assets/large.png";
+    }
+  </script></head><body><img id="badimage" alt=""></body></html>`;
+  const $ = cheerio.load(html);
+  const urls = extractSubresourceUrls($, 'https://testsafebrowsing.appspot.com/s/image_dynamic.html');
+  assert.deepEqual(urls, ['https://testsafebrowsing.appspot.com/s/bad_assets/large.png']);
+});
+
+test('runGoogleSiteStatusCheck detects site-wide unsafe and partially unsafe warnings without false positives on clean sites', async () => {
+  // Partially unsafe site (status 3, social engineering = true, like customer_image.html)
+  const partialFindings = await runGoogleSiteStatusCheck(
+    'https://testsafebrowsing.appspot.com/s/customer_image.html',
+    {
+      fetchFn: (async () =>
+        new Response(
+          `)]}'\n[["sb.ssr",3,false,false,true,false,false,1795308126999,"https://testsafebrowsing.appspot.com/s/customer_image.html",false]]`,
+          { status: 200 }
+        )) as typeof fetch,
+    }
+  );
+  assert.deepEqual(
+    partialFindings.map((f) => f.errorName),
+    ['Social Engineering Detected']
+  );
+
+  // Clean site (status 1 or 4 or 6) must return []
+  for (const cleanStatus of [1, 4, 6]) {
+    const cleanFindings = await runGoogleSiteStatusCheck('https://wordpress.org/', {
+      fetchFn: (async () =>
+        new Response(
+          `)]}'\n[["sb.ssr",${cleanStatus},false,false,false,false,false,1518114575441,"https://wordpress.org/",false]]`,
+          { status: 200 }
+        )) as typeof fetch,
+    });
+    assert.deepEqual(cleanFindings, []);
+  }
+
+  // Graceful fallback on network/HTTP errors
+  const errFindings = await runGoogleSiteStatusCheck('https://example.com/', {
+    fetchFn: (async () => new Response('Rate limited', { status: 429 })) as typeof fetch,
+  });
+  assert.deepEqual(errFindings, []);
+});
+
 
 

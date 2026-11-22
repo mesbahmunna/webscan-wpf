@@ -198,6 +198,19 @@ export function extractSubresourceUrls(
   collect('embed[src]', 'src');
   collect('img[src]', 'src');
 
+  // Also capture statically assigned asset URLs inside inline scripts (e.g., el.src = "...")
+  $('script:not([src])').each((_, el) => {
+    const code = $(el).text();
+    if (!code) return;
+    const regex = /\.(?:src|href)\s*=\s*['"]([^'"\s<>]{3,300})['"]/gi;
+    let match: RegExpExecArray | null;
+    while ((match = regex.exec(code)) !== null) {
+      if (match[1]) {
+        rawCandidates.push(match[1].trim());
+      }
+    }
+  });
+
   let normalizedBase = baseUrl;
   try {
     const parsedBase = new URL(baseUrl);
@@ -582,6 +595,111 @@ export async function verifyGoogleThreatApiStatus(
       message: `Could not reach Google API (${reason}).`,
       latencyMs: Date.now() - startMs,
     };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+export const GOOGLE_SITE_STATUS_ENDPOINT =
+  'https://transparencyreport.google.com/transparencyreport/api/v3/safebrowsing/status';
+
+export interface SiteStatusCheckOptions {
+  timeoutMs?: number;
+  fetchFn?: typeof fetch;
+}
+
+/**
+ * Checks Google Safe Browsing Site Status (the same site-level index used by
+ * Google Transparency Report) to catch domain-wide or "Some pages on this site are unsafe"
+ * warnings (status 2 = Unsafe, status 3 = Partially Unsafe) that exact-URL lookup APIs
+ * do not return when a different page on the same domain is compromised.
+ *
+ * Fails completely gracefully on any network, timeout, rate-limit, or format issue.
+ */
+export async function runGoogleSiteStatusCheck(
+  targetUrl: string,
+  options: SiteStatusCheckOptions = {}
+): Promise<ScanCheckResult[]> {
+  let validatedUri: string;
+  try {
+    const parsed = new URL(targetUrl);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return [];
+    }
+    parsed.hash = '';
+    validatedUri = parsed.toString();
+  } catch {
+    return [];
+  }
+
+  const endpoint = `${GOOGLE_SITE_STATUS_ENDPOINT}?site=${encodeURIComponent(validatedUri)}`;
+  const timeoutMs = options.timeoutMs ?? 2500;
+  const fetchFn = options.fetchFn ?? fetch;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetchFn(endpoint, {
+      method: 'GET',
+      headers: {
+        Accept: 'application/json, text/plain, */*',
+      },
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      return [];
+    }
+
+    const rawText = await response.text();
+    // Strip Google XSSI prefix ")]}'\n"
+    const cleaned = rawText.replace(/^\)\]\}'\s*/, '').trim();
+    if (!cleaned) return [];
+
+    const parsed = JSON.parse(cleaned) as unknown;
+    if (!Array.isArray(parsed) || !Array.isArray(parsed[0])) {
+      return [];
+    }
+
+    const row = parsed[0] as unknown[];
+    if (row[0] !== 'sb.ssr') {
+      return [];
+    }
+
+    const statusCode = typeof row[1] === 'number' ? row[1] : 0;
+    // 2 = Unsafe, 3 = Partially Unsafe ("Some pages on this site are unsafe")
+    if (statusCode !== 2 && statusCode !== 3) {
+      return [];
+    }
+
+    const hasMalware = row[2] === true;
+    const hasUnwanted = row[3] === true;
+    const hasSocialEngineering = row[4] === true;
+
+    const detectedTypes: WebRiskThreatType[] = [];
+    if (hasMalware) detectedTypes.push('MALWARE');
+    if (hasSocialEngineering) detectedTypes.push('SOCIAL_ENGINEERING');
+    if (hasUnwanted) detectedTypes.push('UNWANTED_SOFTWARE');
+
+    if (detectedTypes.length > 0) {
+      return mapThreatTypesToFindings(
+        detectedTypes,
+        'google-safe-browsing-site-status',
+        'Google Safe Browsing Site Status'
+      );
+    }
+
+    return [
+      {
+        errorName: 'Unsafe Site Detected',
+        detected: true,
+        evidence: `Google Safe Browsing Site Status flagged site (status ${statusCode})`,
+        detectionMethod: 'google-safe-browsing-site-status',
+        category: 'malware',
+      },
+    ];
+  } catch {
+    return [];
   } finally {
     clearTimeout(timer);
   }

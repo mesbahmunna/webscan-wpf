@@ -8,6 +8,7 @@ import { runPhpChecks } from './checks/phpCheck.ts';
 import { runMalwareChecks } from './checks/malwareCheck.ts';
 import {
   extractSubresourceUrls,
+  runGoogleSiteStatusCheck,
   runWebRiskBatchCheck,
   runWebRiskCheck,
 } from './checks/webRiskCheck.ts';
@@ -189,8 +190,8 @@ export async function scanWebsite(rawUrl: string): Promise<ScanInternalReport> {
   const deadlineMs = Date.now() + OVERALL_SCAN_TIMEOUT_MS;
   const client = createSafeHttpClient();
 
-  // Phase 1: Primary HTTP fetch, TLS inspection, and Google Web Risk check in parallel
-  const [httpResult, tlsInfo, webRiskFindings] = await Promise.all([
+  // Phase 1: Primary HTTP fetch, TLS inspection, Google Web Risk, and Site Status check in parallel
+  const [httpResult, tlsInfo, webRiskFindings, initialSiteStatusFindings] = await Promise.all([
     client.fetch(normalizedUrl, {
       method: 'GET',
       timeoutMs: 6500,
@@ -201,6 +202,7 @@ export async function scanWebsite(rawUrl: string): Promise<ScanInternalReport> {
     }),
     inspectTlsCertificate(hostname, 4500),
     runWebRiskCheck(normalizedUrl),
+    runGoogleSiteStatusCheck(normalizedUrl, { timeoutMs: 4500 }),
   ]);
 
   let parsedFinalUrl = parsedInitialUrl;
@@ -248,6 +250,21 @@ export async function scanWebsite(rawUrl: string): Promise<ScanInternalReport> {
     if (secondaryThreatUrls.length > 0) {
       effectiveWebRiskFindings = await runWebRiskBatchCheck(secondaryThreatUrls, {
         timeoutMs: Math.min(3500, Math.max(500, deadlineMs - Date.now() - 800)),
+      });
+    }
+  }
+
+  // Fallback to Google Safe Browsing Site Status for site-wide / "Some pages on this site are unsafe" warnings
+  if (effectiveWebRiskFindings.length === 0) {
+    if (initialSiteStatusFindings.length > 0) {
+      effectiveWebRiskFindings = initialSiteStatusFindings;
+    } else if (
+      httpResult.finalUrl &&
+      parsedFinalUrl.hostname.toLowerCase() !== hostname.toLowerCase() &&
+      Date.now() < deadlineMs - 1500
+    ) {
+      effectiveWebRiskFindings = await runGoogleSiteStatusCheck(httpResult.finalUrl, {
+        timeoutMs: Math.min(3500, Math.max(500, deadlineMs - Date.now() - 600)),
       });
     }
   }
