@@ -16,12 +16,31 @@ export const WEB_RISK_THREAT_NAME_MAP: Record<WebRiskThreatType, string> = {
   UNWANTED_SOFTWARE: 'Unwanted Software Detected',
 };
 
-const DEFAULT_WEB_RISK_TIMEOUT_MS = 4000;
+const DEFAULT_WEB_RISK_TIMEOUT_MS = 6000;
+
+let loggedMissingKeyWarning = false;
+
+export interface WebRiskDiagnostic {
+  configured: boolean;
+  lastOutcome: 'not-run' | 'ok' | 'unconfigured' | 'http-error' | 'network-error';
+  lastHttpStatus?: number;
+  lastErrorStatus?: string;
+  lastErrorMessage?: string;
+}
+
+let lastDiagnostic: Omit<WebRiskDiagnostic, 'configured'> = {
+  lastOutcome: 'not-run',
+};
 
 interface WebRiskApiResponse {
   threat?: {
     threatTypes?: unknown;
     expireTime?: unknown;
+  };
+  error?: {
+    code?: unknown;
+    message?: unknown;
+    status?: unknown;
   };
 }
 
@@ -32,12 +51,35 @@ export interface WebRiskCheckOptions {
 }
 
 function getConfiguredWebRiskApiKey(overrideKey?: string): string {
-  const raw = overrideKey !== undefined ? overrideKey : process.env.GOOGLE_WEB_RISK_API_KEY;
+  const raw =
+    overrideKey !== undefined
+      ? overrideKey
+      : process.env.GOOGLE_WEB_RISK_API_KEY ??
+        process.env.GOOGLE_WEBRISK_API_KEY ??
+        process.env.WEB_RISK_API_KEY;
   if (typeof raw !== 'string') return '';
-  const trimmed = raw.trim();
+  let trimmed = raw.trim();
+  // Strip accidental surrounding quotes pasted into environment variable UIs
+  if (
+    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+    (trimmed.startsWith("'") && trimmed.endsWith("'"))
+  ) {
+    trimmed = trimmed.slice(1, -1).trim();
+  }
   // Treat obvious template placeholders as unconfigured
   if (!trimmed || trimmed === 'MY_GOOGLE_WEB_RISK_API_KEY') return '';
   return trimmed;
+}
+
+export function isWebRiskConfigured(): boolean {
+  return getConfiguredWebRiskApiKey().length > 0;
+}
+
+export function getWebRiskDiagnostic(): WebRiskDiagnostic {
+  return {
+    configured: isWebRiskConfigured(),
+    ...lastDiagnostic,
+  };
 }
 
 /**
@@ -52,8 +94,16 @@ export async function runWebRiskCheck(
   targetUrl: string,
   options: WebRiskCheckOptions = {}
 ): Promise<ScanCheckResult[]> {
+  const isProdRuntimeCall = options.apiKey === undefined && options.fetchFn === undefined;
   const apiKey = getConfiguredWebRiskApiKey(options.apiKey);
   if (!apiKey) {
+    if (isProdRuntimeCall) {
+      lastDiagnostic = { lastOutcome: 'unconfigured' };
+      if (!loggedMissingKeyWarning) {
+        loggedMissingKeyWarning = true;
+        console.warn('[WebRisk] GOOGLE_WEB_RISK_API_KEY is not configured; skipping Web Risk lookup.');
+      }
+    }
     return [];
   }
 
@@ -90,10 +140,40 @@ export async function runWebRiskCheck(
     });
 
     if (!response.ok) {
+      let errStatus: string | undefined;
+      let errMessage = response.statusText || 'Unknown error';
+      try {
+        const errPayload = (await response.json()) as WebRiskApiResponse;
+        if (typeof errPayload?.error?.status === 'string' && errPayload.error.status.trim()) {
+          errStatus = errPayload.error.status.trim();
+        }
+        if (typeof errPayload?.error?.message === 'string' && errPayload.error.message.trim()) {
+          errMessage = errPayload.error.message.trim();
+        }
+      } catch {
+        // Ignore non-JSON error bodies
+      }
+      const detail = errStatus ? `${errStatus}: ${errMessage}` : errMessage;
+      if (isProdRuntimeCall) {
+        lastDiagnostic = {
+          lastOutcome: 'http-error',
+          lastHttpStatus: response.status,
+          lastErrorStatus: errStatus,
+          lastErrorMessage: errMessage,
+        };
+      }
+      console.warn(`[WebRisk] API returned HTTP ${response.status}: ${detail}`);
       return [];
     }
 
     const data = (await response.json()) as WebRiskApiResponse;
+    if (isProdRuntimeCall) {
+      lastDiagnostic = {
+        lastOutcome: 'ok',
+        lastHttpStatus: response.status,
+      };
+    }
+
     const rawTypes = data?.threat?.threatTypes;
     if (!Array.isArray(rawTypes) || rawTypes.length === 0) {
       return [];
@@ -119,8 +199,16 @@ export async function runWebRiskCheck(
     }
 
     return results;
-  } catch {
+  } catch (err) {
     // Graceful fallback: never fail or stall a scan if Web Risk API is unreachable
+    const reason = err instanceof Error ? `${err.name}: ${err.message}` : 'Request failed';
+    if (isProdRuntimeCall) {
+      lastDiagnostic = {
+        lastOutcome: 'network-error',
+        lastErrorMessage: reason,
+      };
+    }
+    console.warn(`[WebRisk] Lookup failed gracefully (${reason})`);
     return [];
   } finally {
     clearTimeout(timer);

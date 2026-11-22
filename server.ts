@@ -3,6 +3,7 @@ import express from 'express';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { scanWebsite } from './src/scanner/engine.ts';
+import { isWebRiskConfigured } from './src/scanner/checks/webRiskCheck.ts';
 import { RateLimiter, validateAndNormalizeUrl } from './src/scanner/security.ts';
 import type { ScanPublicResponse } from './src/scanner/types.ts';
 
@@ -42,7 +43,7 @@ async function startServer() {
   });
 
   app.get('/api/health', (_req, res) => {
-    res.json({ ok: true });
+    res.json({ ok: true, webRiskConfigured: isWebRiskConfigured() });
   });
 
   app.post('/api/scan', async (req, res) => {

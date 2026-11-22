@@ -280,3 +280,24 @@ test('testsafebrowsing.appspot.com test URLs map accurately to Malware, Social E
   }
 });
 
+test('runWebRiskCheck strips accidental surrounding quotes from API keys', async () => {
+  let sentKey = '';
+  const mockFetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
+    sentKey = (init?.headers as Record<string, string>)['X-Goog-Api-Key'] || '';
+    return new Response(
+      JSON.stringify({ threat: { threatTypes: ['MALWARE'] } }),
+      { status: 200, headers: { 'content-type': 'application/json' } }
+    );
+  }) as typeof fetch;
+
+  const findings = await runWebRiskCheck('https://testsafebrowsing.appspot.com/s/malware.html', {
+    apiKey: '  "AIzaQuotedTestKey123"  ',
+    fetchFn: mockFetch,
+  });
+
+  assert.equal(sentKey, 'AIzaQuotedTestKey123');
+  assert.deepEqual(
+    findings.map((f) => f.errorName),
+    ['Malware Detected']
+  );
+});
