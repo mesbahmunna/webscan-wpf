@@ -1,3 +1,4 @@
+import type * as cheerio from 'cheerio';
 import type { ScanCheckResult } from '../types.ts';
 
 export const WEB_RISK_API_ENDPOINT = 'https://webrisk.googleapis.com/v1/uris:search';
@@ -6,6 +7,15 @@ export const WEB_RISK_THREAT_TYPES = [
   'MALWARE',
   'SOCIAL_ENGINEERING',
   'UNWANTED_SOFTWARE',
+] as const;
+
+export const SAFE_BROWSING_PLATFORM_TYPES = [
+  'ANY_PLATFORM',
+  'WINDOWS',
+  'LINUX',
+  'OSX',
+  'ANDROID',
+  'IOS',
 ] as const;
 
 export type WebRiskThreatType = (typeof WEB_RISK_THREAT_TYPES)[number];
@@ -17,6 +27,7 @@ export const WEB_RISK_THREAT_NAME_MAP: Record<WebRiskThreatType, string> = {
 };
 
 const DEFAULT_WEB_RISK_TIMEOUT_MS = 6000;
+const API_CHECK_TEST_URL = 'https://testsafebrowsing.appspot.com/s/malware.html';
 
 let loggedMissingKeyWarning = false;
 
@@ -26,6 +37,14 @@ export interface WebRiskDiagnostic {
   lastHttpStatus?: number;
   lastErrorStatus?: string;
   lastErrorMessage?: string;
+}
+
+export interface ApiStatusCheckResult {
+  working: boolean;
+  configured: boolean;
+  provider?: 'Google Web Risk API' | 'Google Safe Browsing API v4';
+  message: string;
+  latencyMs: number;
 }
 
 let lastDiagnostic: Omit<WebRiskDiagnostic, 'configured'> = {
@@ -123,8 +142,96 @@ function mapThreatTypesToFindings(
   return results;
 }
 
-async function querySafeBrowsingFallback(
-  validatedUri: string,
+function normalizeHttpUrls(urls: string[], maxCount = 30): string[] {
+  const seen = new Set<string>();
+  const valid: string[] = [];
+
+  for (const raw of urls) {
+    if (typeof raw !== 'string') continue;
+    const trimmed = raw.trim();
+    if (!trimmed) continue;
+    try {
+      const parsed = new URL(trimmed);
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') continue;
+      parsed.hash = '';
+      const normalized = parsed.toString();
+      if (!seen.has(normalized)) {
+        seen.add(normalized);
+        valid.push(normalized);
+        if (valid.length >= maxCount) break;
+      }
+    } catch {
+      // Skip invalid URLs
+    }
+  }
+
+  return valid;
+}
+
+/**
+ * Extracts prioritized embedded subresource URLs (iframes, scripts, stylesheets, images, embeds)
+ * from a parsed HTML document so pages embedding malicious third-party or relative assets
+ * (such as injected iframes or scripts) are also checked against Google's threat lists.
+ */
+export function extractSubresourceUrls(
+  $: cheerio.CheerioAPI,
+  baseUrl: string,
+  limit = 25
+): string[] {
+  const rawCandidates: string[] = [];
+
+  const collect = (selector: string, attr: string) => {
+    $(selector).each((_, el) => {
+      const val = $(el).attr(attr);
+      if (val && val.trim()) {
+        rawCandidates.push(val.trim());
+      }
+    });
+  };
+
+  // Prioritize highest-risk embedded vectors first
+  collect('iframe[src]', 'src');
+  collect('frame[src]', 'src');
+  collect('script[src]', 'src');
+  collect('link[rel~="stylesheet"][href]', 'href');
+  collect('object[data]', 'data');
+  collect('embed[src]', 'src');
+  collect('img[src]', 'src');
+
+  let normalizedBase = baseUrl;
+  try {
+    const parsedBase = new URL(baseUrl);
+    parsedBase.hash = '';
+    normalizedBase = parsedBase.toString();
+  } catch {
+    return [];
+  }
+
+  const resolved: string[] = [];
+  const seen = new Set<string>([normalizedBase]);
+
+  for (const candidate of rawCandidates) {
+    if (/^(?:data|javascript|mailto|tel|blob|about):/i.test(candidate)) continue;
+    try {
+      const abs = new URL(candidate, normalizedBase);
+      if (abs.protocol !== 'http:' && abs.protocol !== 'https:') continue;
+      abs.hash = '';
+      const str = abs.toString();
+      if (!seen.has(str)) {
+        seen.add(str);
+        resolved.push(str);
+        if (resolved.length >= limit) break;
+      }
+    } catch {
+      // Ignore malformed attribute values
+    }
+  }
+
+  return resolved;
+}
+
+async function querySafeBrowsingBatch(
+  validatedUris: string[],
   apiKey: string,
   fetchFn: typeof fetch,
   signal: AbortSignal
@@ -143,9 +250,9 @@ async function querySafeBrowsingFallback(
       },
       threatInfo: {
         threatTypes: [...WEB_RISK_THREAT_TYPES],
-        platformTypes: ['ANY_PLATFORM'],
+        platformTypes: [...SAFE_BROWSING_PLATFORM_TYPES],
         threatEntryTypes: ['URL'],
-        threatEntries: [{ url: validatedUri }],
+        threatEntries: validatedUris.map((url) => ({ url })),
       },
     }),
     signal,
@@ -181,21 +288,76 @@ async function querySafeBrowsingFallback(
   };
 }
 
+async function queryWebRiskSingle(
+  validatedUri: string,
+  apiKey: string,
+  fetchFn: typeof fetch,
+  signal: AbortSignal
+): Promise<{
+  ok: boolean;
+  status: number;
+  findings: ScanCheckResult[];
+  errStatus?: string;
+  errMessage?: string;
+}> {
+  const endpoint = new URL(WEB_RISK_API_ENDPOINT);
+  for (const threatType of WEB_RISK_THREAT_TYPES) {
+    endpoint.searchParams.append('threatTypes', threatType);
+  }
+  endpoint.searchParams.set('uri', validatedUri);
+
+  const response = await fetchFn(endpoint.toString(), {
+    method: 'GET',
+    headers: {
+      Accept: 'application/json',
+      'X-Goog-Api-Key': apiKey,
+    },
+    signal,
+  });
+
+  if (!response.ok) {
+    let errStatus: string | undefined;
+    let errMessage = response.statusText || 'Unknown error';
+    try {
+      const errPayload = (await response.json()) as WebRiskApiResponse;
+      if (typeof errPayload?.error?.status === 'string' && errPayload.error.status.trim()) {
+        errStatus = errPayload.error.status.trim();
+      }
+      if (typeof errPayload?.error?.message === 'string' && errPayload.error.message.trim()) {
+        errMessage = errPayload.error.message.trim();
+      }
+    } catch {
+      // Ignore non-JSON error bodies
+    }
+    return {
+      ok: false,
+      status: response.status,
+      findings: [],
+      errStatus,
+      errMessage,
+    };
+  }
+
+  const data = (await response.json()) as WebRiskApiResponse;
+  const rawTypes = data?.threat?.threatTypes;
+  const findings =
+    Array.isArray(rawTypes) && rawTypes.length > 0
+      ? mapThreatTypesToFindings(rawTypes, 'google-web-risk-api', 'Google Web Risk')
+      : [];
+
+  return { ok: true, status: response.status, findings };
+}
+
 const SAFE_BROWSING_FALLBACK_TTL_MS = 10 * 60 * 1000;
 let preferSafeBrowsingUntil = 0;
 
 /**
- * Queries Google Web Risk Lookup API (v1/uris:search) for MALWARE,
- * SOCIAL_ENGINEERING, and UNWANTED_SOFTWARE.
- *
- * - Keeps the API key strictly on the backend (sent via X-Goog-Api-Key header).
- * - If Web Risk returns HTTP 403 (e.g., key is enabled for Safe Browsing API v4 instead),
- *   falls back to Google Safe Browsing Lookup API v4 with the same threat types.
- * - Deduplicates detected threats and returns only clean threat names.
- * - Fails gracefully on missing credentials, timeouts, HTTP errors, or invalid JSON.
+ * Checks a batch of URLs (main page + optional redirects/embedded subresources)
+ * against Google Web Risk API v1, with automatic fallback to Google Safe Browsing API v4
+ * if Web Risk returns HTTP 403.
  */
-export async function runWebRiskCheck(
-  targetUrl: string,
+export async function runWebRiskBatchCheck(
+  urls: string[],
   options: WebRiskCheckOptions = {}
 ): Promise<ScanCheckResult[]> {
   const isProdRuntimeCall = options.apiKey === undefined && options.fetchFn === undefined;
@@ -211,22 +373,10 @@ export async function runWebRiskCheck(
     return [];
   }
 
-  let validatedUri: string;
-  try {
-    const parsed = new URL(targetUrl);
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      return [];
-    }
-    validatedUri = parsed.toString();
-  } catch {
+  const validatedUris = normalizeHttpUrls(urls, 30);
+  if (validatedUris.length === 0) {
     return [];
   }
-
-  const endpoint = new URL(WEB_RISK_API_ENDPOINT);
-  for (const threatType of WEB_RISK_THREAT_TYPES) {
-    endpoint.searchParams.append('threatTypes', threatType);
-  }
-  endpoint.searchParams.set('uri', validatedUri);
 
   const timeoutMs = options.timeoutMs ?? DEFAULT_WEB_RISK_TIMEOUT_MS;
   const fetchFn = options.fetchFn ?? fetch;
@@ -235,8 +385,8 @@ export async function runWebRiskCheck(
 
   try {
     if (isProdRuntimeCall && Date.now() < preferSafeBrowsingUntil) {
-      const sbRes = await querySafeBrowsingFallback(
-        validatedUri,
+      const sbRes = await querySafeBrowsingBatch(
+        validatedUris,
         apiKey,
         fetchFn,
         controller.signal
@@ -245,38 +395,24 @@ export async function runWebRiskCheck(
         lastDiagnostic = { lastOutcome: 'ok', lastHttpStatus: sbRes.status };
         return sbRes.findings;
       }
-      // Reset preference if Safe Browsing stopped succeeding
       preferSafeBrowsingUntil = 0;
     }
 
-    const response = await fetchFn(endpoint.toString(), {
-      method: 'GET',
-      headers: {
-        Accept: 'application/json',
-        'X-Goog-Api-Key': apiKey,
-      },
-      signal: controller.signal,
-    });
+    const primaryRes = await queryWebRiskSingle(
+      validatedUris[0],
+      apiKey,
+      fetchFn,
+      controller.signal
+    );
 
-    if (!response.ok) {
-      let errStatus: string | undefined;
-      let errMessage = response.statusText || 'Unknown error';
-      try {
-        const errPayload = (await response.json()) as WebRiskApiResponse;
-        if (typeof errPayload?.error?.status === 'string' && errPayload.error.status.trim()) {
-          errStatus = errPayload.error.status.trim();
-        }
-        if (typeof errPayload?.error?.message === 'string' && errPayload.error.message.trim()) {
-          errMessage = errPayload.error.message.trim();
-        }
-      } catch {
-        // Ignore non-JSON error bodies
-      }
-      const detail = errStatus ? `${errStatus}: ${errMessage}` : errMessage;
+    if (!primaryRes.ok) {
+      const detail = primaryRes.errStatus
+        ? `${primaryRes.errStatus}: ${primaryRes.errMessage || 'Unknown error'}`
+        : primaryRes.errMessage || 'Unknown error';
 
-      if (response.status === 403) {
-        const fallback = await querySafeBrowsingFallback(
-          validatedUri,
+      if (primaryRes.status === 403) {
+        const fallback = await querySafeBrowsingBatch(
+          validatedUris,
           apiKey,
           fetchFn,
           controller.signal
@@ -295,36 +431,52 @@ export async function runWebRiskCheck(
           `[WebRisk] API returned HTTP 403 (${detail}); Safe Browsing v4 fallback returned HTTP ${fallback.status} (${fallback.detail || 'error'})`
         );
       } else {
-        console.warn(`[WebRisk] API returned HTTP ${response.status}: ${detail}`);
+        console.warn(`[WebRisk] API returned HTTP ${primaryRes.status}: ${detail}`);
       }
 
       if (isProdRuntimeCall) {
         lastDiagnostic = {
           lastOutcome: 'http-error',
-          lastHttpStatus: response.status,
-          lastErrorStatus: errStatus,
-          lastErrorMessage: errMessage,
+          lastHttpStatus: primaryRes.status,
+          lastErrorStatus: primaryRes.errStatus,
+          lastErrorMessage: primaryRes.errMessage,
         };
       }
       return [];
     }
 
-    const data = (await response.json()) as WebRiskApiResponse;
     if (isProdRuntimeCall) {
       lastDiagnostic = {
         lastOutcome: 'ok',
-        lastHttpStatus: response.status,
+        lastHttpStatus: primaryRes.status,
       };
     }
 
-    const rawTypes = data?.threat?.threatTypes;
-    if (!Array.isArray(rawTypes) || rawTypes.length === 0) {
-      return [];
+    if (primaryRes.findings.length > 0 || validatedUris.length === 1) {
+      return primaryRes.findings;
     }
 
-    return mapThreatTypesToFindings(rawTypes, 'google-web-risk-api', 'Google Web Risk');
+    // Check up to 8 additional subresource URLs in parallel against Web Risk v1
+    const extraUris = validatedUris.slice(1, 9);
+    const extraSettled = await Promise.allSettled(
+      extraUris.map((uri) => queryWebRiskSingle(uri, apiKey, fetchFn, controller.signal))
+    );
+
+    const combined: ScanCheckResult[] = [];
+    const seenNames = new Set<string>();
+    for (const outcome of extraSettled) {
+      if (outcome.status === 'fulfilled' && outcome.value.ok) {
+        for (const finding of outcome.value.findings) {
+          if (!seenNames.has(finding.errorName)) {
+            seenNames.add(finding.errorName);
+            combined.push(finding);
+          }
+        }
+      }
+    }
+
+    return combined;
   } catch (err) {
-    // Graceful fallback: never fail or stall a scan if Web Risk API is unreachable
     const reason = err instanceof Error ? `${err.name}: ${err.message}` : 'Request failed';
     if (isProdRuntimeCall) {
       lastDiagnostic = {
@@ -334,6 +486,102 @@ export async function runWebRiskCheck(
     }
     console.warn(`[WebRisk] Lookup failed gracefully (${reason})`);
     return [];
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Queries Google Web Risk Lookup API (v1/uris:search) for a single URL,
+ * with automatic fallback to Google Safe Browsing API v4 on HTTP 403.
+ */
+export async function runWebRiskCheck(
+  targetUrl: string,
+  options: WebRiskCheckOptions = {}
+): Promise<ScanCheckResult[]> {
+  return runWebRiskBatchCheck([targetUrl], options);
+}
+
+/**
+ * Performs a live backend verification against Google's official malware test URL
+ * to confirm whether the configured API key is active and detecting threats.
+ * Never exposes the API key in its response.
+ */
+export async function verifyGoogleThreatApiStatus(
+  options: WebRiskCheckOptions = {}
+): Promise<ApiStatusCheckResult> {
+  const startMs = Date.now();
+  const apiKey = getConfiguredWebRiskApiKey(options.apiKey);
+  if (!apiKey) {
+    return {
+      working: false,
+      configured: false,
+      message: 'API key is not configured (set GOOGLE_WEB_RISK_API_KEY in environment variables).',
+      latencyMs: Date.now() - startMs,
+    };
+  }
+
+  const timeoutMs = options.timeoutMs ?? DEFAULT_WEB_RISK_TIMEOUT_MS;
+  const fetchFn = options.fetchFn ?? fetch;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const wrRes = await queryWebRiskSingle(API_CHECK_TEST_URL, apiKey, fetchFn, controller.signal);
+    if (wrRes.ok) {
+      const detectedMalware = wrRes.findings.some((f) => f.errorName === 'Malware Detected');
+      return {
+        working: detectedMalware,
+        configured: true,
+        provider: 'Google Web Risk API',
+        message: detectedMalware
+          ? 'Google Web Risk API is working properly.'
+          : 'Google Web Risk API responded, but did not flag the malware test URL.',
+        latencyMs: Date.now() - startMs,
+      };
+    }
+
+    if (wrRes.status === 403) {
+      const sbRes = await querySafeBrowsingBatch(
+        [API_CHECK_TEST_URL],
+        apiKey,
+        fetchFn,
+        controller.signal
+      );
+      if (sbRes.ok) {
+        const detectedMalware = sbRes.findings.some((f) => f.errorName === 'Malware Detected');
+        return {
+          working: detectedMalware,
+          configured: true,
+          provider: 'Google Safe Browsing API v4',
+          message: detectedMalware
+            ? 'Google Safe Browsing API v4 is working properly.'
+            : 'Google Safe Browsing API v4 responded, but did not flag the malware test URL.',
+          latencyMs: Date.now() - startMs,
+        };
+      }
+      return {
+        working: false,
+        configured: true,
+        message: `API rejected (HTTP ${wrRes.status}): ${wrRes.errMessage || sbRes.detail || 'Permission denied. Enable Web Risk API or Safe Browsing API in Google Cloud.'}`,
+        latencyMs: Date.now() - startMs,
+      };
+    }
+
+    return {
+      working: false,
+      configured: true,
+      message: `API error (HTTP ${wrRes.status}): ${wrRes.errMessage || 'Check your API key configuration.'}`,
+      latencyMs: Date.now() - startMs,
+    };
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : 'Network or timeout error';
+    return {
+      working: false,
+      configured: true,
+      message: `Could not reach Google API (${reason}).`,
+      latencyMs: Date.now() - startMs,
+    };
   } finally {
     clearTimeout(timer);
   }

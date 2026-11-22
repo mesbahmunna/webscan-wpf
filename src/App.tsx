@@ -1,5 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ExternalLink, Menu } from 'lucide-react';
+import {
+  CheckCircle2,
+  ExternalLink,
+  Loader2,
+  Menu,
+  ShieldCheck,
+  X,
+  XCircle,
+} from 'lucide-react';
 import { DashboardSidebar, type WorkspaceView } from './components/DashboardSidebar';
 import { BulkScannerWorkspace } from './components/BulkScannerWorkspace';
 import { SingleScannerWorkspace } from './components/SingleScannerWorkspace';
@@ -11,6 +19,14 @@ import {
   saveTasksAsync,
   type BulkScanTask,
 } from './utils/taskStorage';
+
+interface ApiStatusResponse {
+  working: boolean;
+  configured: boolean;
+  provider?: string;
+  message: string;
+  latencyMs?: number;
+}
 
 export default function App() {
   const initialRef = useRef<{ tasks: BulkScanTask[]; activeTaskId: string | null } | null>(null);
@@ -29,6 +45,9 @@ export default function App() {
   const [tasks, setTasks] = useState<BulkScanTask[]>(initialRef.current.tasks);
   const [activeTaskId, setActiveTaskId] = useState<string | null>(initialRef.current.activeTaskId);
   const [scanningTaskId, setScanningTaskId] = useState<string | null>(null);
+  const [checkingApi, setCheckingApi] = useState(false);
+  const [apiStatus, setApiStatus] = useState<ApiStatusResponse | null>(null);
+  const [showApiPopover, setShowApiPopover] = useState(false);
 
   const hydratedRef = useRef(false);
   const tasksRef = useRef<BulkScanTask[]>(tasks);
@@ -130,6 +149,33 @@ export default function App() {
     });
   }, []);
 
+  const handleCheckApi = useCallback(async () => {
+    if (checkingApi) return;
+    setCheckingApi(true);
+    setShowApiPopover(true);
+    try {
+      const res = await fetch('/api/check-api', { method: 'GET', cache: 'no-store' });
+      const data = (await res.json().catch(() => null)) as ApiStatusResponse | null;
+      if (!res.ok || !data) {
+        setApiStatus({
+          working: false,
+          configured: false,
+          message: `API check endpoint returned HTTP ${res.status}.`,
+        });
+      } else {
+        setApiStatus(data);
+      }
+    } catch {
+      setApiStatus({
+        working: false,
+        configured: false,
+        message: 'Network error while contacting /api/check-api.',
+      });
+    } finally {
+      setCheckingApi(false);
+    }
+  }, [checkingApi]);
+
   const viewTitle = activeView === 'bulk' ? 'Bulk CSV Scanner' : 'Single URL Scanner';
 
   return (
@@ -191,15 +237,106 @@ export default function App() {
             </div>
           </div>
 
-          <a
-            href="https://wordpressfixer.com/"
-            target="_blank"
-            rel="noopener noreferrer"
-            className="inline-flex items-center gap-1.5 text-xs sm:text-sm font-medium text-slate-600 hover:text-[#1D4ED8] transition-colors whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1D4ED8] focus-visible:ring-offset-2 rounded-md py-1"
-          >
-            <span>wordpressfixer.com</span>
-            <ExternalLink className="w-3.5 h-3.5" aria-hidden="true" />
-          </a>
+          <div className="flex items-center gap-3 shrink-0">
+            <div className="relative">
+              <button
+                type="button"
+                onClick={handleCheckApi}
+                disabled={checkingApi}
+                data-testid="check-api-btn"
+                className={`h-8 px-3 rounded-lg border text-xs font-medium inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1D4ED8] focus-visible:ring-offset-2 ${
+                  apiStatus?.working
+                    ? 'border-emerald-200 bg-emerald-50 text-emerald-700 hover:bg-emerald-100/70'
+                    : apiStatus && !apiStatus.working
+                      ? 'border-red-200 bg-red-50 text-red-700 hover:bg-red-100/70'
+                      : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50 hover:text-slate-900'
+                }`}
+              >
+                {checkingApi ? (
+                  <>
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" aria-hidden="true" />
+                    <span>Checking API...</span>
+                  </>
+                ) : apiStatus?.working ? (
+                  <>
+                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" aria-hidden="true" />
+                    <span>API Working</span>
+                  </>
+                ) : apiStatus && !apiStatus.working ? (
+                  <>
+                    <XCircle className="w-3.5 h-3.5 text-red-600" aria-hidden="true" />
+                    <span>API Not Working</span>
+                  </>
+                ) : (
+                  <>
+                    <ShieldCheck className="w-3.5 h-3.5 text-slate-500" aria-hidden="true" />
+                    <span>Check API</span>
+                  </>
+                )}
+              </button>
+
+              {showApiPopover && (checkingApi || apiStatus) && (
+                <div
+                  role="status"
+                  data-testid="api-status-popover"
+                  className="absolute right-0 mt-2 w-72 sm:w-80 rounded-xl bg-white border border-slate-200 shadow-lg p-3.5 z-40"
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="flex items-center gap-2 min-w-0">
+                      {checkingApi ? (
+                        <Loader2 className="w-4 h-4 animate-spin text-[#1D4ED8] shrink-0" />
+                      ) : apiStatus?.working ? (
+                        <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                      ) : (
+                        <XCircle className="w-4 h-4 text-red-600 shrink-0" />
+                      )}
+                      <span className="text-xs font-semibold text-slate-900">
+                        {checkingApi
+                          ? 'Testing Google Threat API...'
+                          : apiStatus?.working
+                            ? 'Google API Connected'
+                            : 'Google API Not Working'}
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setShowApiPopover(false)}
+                      aria-label="Close API status"
+                      className="w-6 h-6 inline-flex items-center justify-center rounded-md text-slate-400 hover:text-slate-700 hover:bg-slate-100 cursor-pointer shrink-0"
+                    >
+                      <X className="w-3.5 h-3.5" aria-hidden="true" />
+                    </button>
+                  </div>
+
+                  {!checkingApi && apiStatus && (
+                    <div className="mt-2 space-y-1.5 text-xs text-slate-600 leading-relaxed">
+                      <p>{apiStatus.message}</p>
+                      {(apiStatus.provider || apiStatus.latencyMs !== undefined) && (
+                        <p className="text-[11px] font-mono tabular-nums text-slate-400">
+                          {[
+                            apiStatus.provider,
+                            apiStatus.latencyMs !== undefined ? `${apiStatus.latencyMs}ms` : null,
+                          ]
+                            .filter(Boolean)
+                            .join(' · ')}
+                        </p>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <a
+              href="https://wordpressfixer.com/"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="hidden sm:inline-flex items-center gap-1.5 text-xs sm:text-sm font-medium text-slate-600 hover:text-[#1D4ED8] transition-colors whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#1D4ED8] focus-visible:ring-offset-2 rounded-md py-1"
+            >
+              <span>wordpressfixer.com</span>
+              <ExternalLink className="w-3.5 h-3.5" aria-hidden="true" />
+            </a>
+          </div>
         </header>
 
         <main className="flex-1 w-full max-w-6xl mx-auto px-4 sm:px-8 py-6 sm:py-8">

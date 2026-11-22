@@ -2,7 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import * as cheerio from 'cheerio';
 import {
+  extractSubresourceUrls,
+  runWebRiskBatchCheck,
   runWebRiskCheck,
+  verifyGoogleThreatApiStatus,
   WEB_RISK_API_ENDPOINT,
   WEB_RISK_THREAT_TYPES,
 } from './checks/webRiskCheck.ts';
@@ -342,4 +345,98 @@ test('runWebRiskCheck automatically falls back to Safe Browsing API v4 when Web 
     ['Malware Detected', 'Social Engineering Detected']
   );
 });
+
+test('extractSubresourceUrls resolves protocol-relative iframes, scripts, stylesheets, and images', () => {
+  const html = `<!doctype html>
+    <html>
+      <head>
+        <link rel="stylesheet" href="bad_assets/style.css" />
+        <script src="bad_assets/script.js"></script>
+      </head>
+      <body>
+        <iframe src="//testsafebrowsing.appspot.com/s/malware.html"></iframe>
+        <img src="bad_assets/small.png" />
+        <img src="data:image/png;base64,AAAA" />
+      </body>
+    </html>`;
+  const $ = cheerio.load(html);
+  const urls = extractSubresourceUrls($, 'https://testsafebrowsing.appspot.com/s/malware_in_iframe.html');
+
+  assert.deepEqual(urls, [
+    'https://testsafebrowsing.appspot.com/s/malware.html',
+    'https://testsafebrowsing.appspot.com/s/bad_assets/script.js',
+    'https://testsafebrowsing.appspot.com/s/bad_assets/style.css',
+    'https://testsafebrowsing.appspot.com/s/bad_assets/small.png',
+  ]);
+});
+
+test('runWebRiskBatchCheck catches malicious subresources via Safe Browsing v4 batch request', async () => {
+  let capturedEntries: Array<{ url: string }> = [];
+  const mockFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const urlStr = String(input);
+    if (urlStr.startsWith(WEB_RISK_API_ENDPOINT)) {
+      return new Response(JSON.stringify({ error: { code: 403, status: 'PERMISSION_DENIED' } }), {
+        status: 403,
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    const parsedBody = JSON.parse(String(init?.body || '{}')) as {
+      threatInfo?: { threatEntries?: Array<{ url: string }> };
+    };
+    capturedEntries = parsedBody.threatInfo?.threatEntries ?? [];
+    return new Response(JSON.stringify({ matches: [{ threatType: 'MALWARE' }] }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  }) as typeof fetch;
+
+  const findings = await runWebRiskBatchCheck(
+    [
+      'https://testsafebrowsing.appspot.com/s/malware_in_iframe.html',
+      'https://testsafebrowsing.appspot.com/s/malware.html',
+    ],
+    { apiKey: 'batch-key', fetchFn: mockFetch }
+  );
+
+  assert.equal(capturedEntries.length, 2);
+  assert.deepEqual(
+    findings.map((f) => f.errorName),
+    ['Malware Detected']
+  );
+});
+
+test('verifyGoogleThreatApiStatus reports working, unconfigured, and error states cleanly', async () => {
+  const unconfigured = await verifyGoogleThreatApiStatus({ apiKey: '' });
+  assert.equal(unconfigured.working, false);
+  assert.equal(unconfigured.configured, false);
+
+  const workingWebRisk = await verifyGoogleThreatApiStatus({
+    apiKey: 'valid-key',
+    fetchFn: (async () =>
+      new Response(JSON.stringify({ threat: { threatTypes: ['MALWARE'] } }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })) as typeof fetch,
+  });
+  assert.equal(workingWebRisk.working, true);
+  assert.equal(workingWebRisk.provider, 'Google Web Risk API');
+
+  const workingFallback = await verifyGoogleThreatApiStatus({
+    apiKey: 'sb-key',
+    fetchFn: (async (input: RequestInfo | URL) => {
+      if (String(input).startsWith(WEB_RISK_API_ENDPOINT)) {
+        return new Response(JSON.stringify({ error: { status: 'PERMISSION_DENIED' } }), {
+          status: 403,
+        });
+      }
+      return new Response(JSON.stringify({ matches: [{ threatType: 'MALWARE' }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof fetch,
+  });
+  assert.equal(workingFallback.working, true);
+  assert.equal(workingFallback.provider, 'Google Safe Browsing API v4');
+});
+
 

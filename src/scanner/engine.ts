@@ -6,7 +6,11 @@ import { inspectTlsCertificate, runSslChecks } from './checks/sslCheck.ts';
 import { detectWordPressFootprint, runWordPressChecks } from './checks/wordpressCheck.ts';
 import { runPhpChecks } from './checks/phpCheck.ts';
 import { runMalwareChecks } from './checks/malwareCheck.ts';
-import { runWebRiskCheck } from './checks/webRiskCheck.ts';
+import {
+  extractSubresourceUrls,
+  runWebRiskBatchCheck,
+  runWebRiskCheck,
+} from './checks/webRiskCheck.ts';
 import type {
   ScanCategory,
   ScanCheckResult,
@@ -217,16 +221,35 @@ export async function scanWebsite(rawUrl: string): Promise<ScanInternalReport> {
     effectiveTlsInfo = await inspectTlsCertificate(parsedFinalUrl.hostname, 3500);
   }
 
+  // Parse HTML once if response looks like HTML
+  const contentType = String(httpResult.headers['content-type'] || '').toLowerCase();
+  const bodyTrimmed = (httpResult.body || '').trimStart();
+  const isHtml =
+    Boolean(httpResult.body) &&
+    (contentType.includes('text/html') ||
+      contentType.includes('application/xhtml+xml') ||
+      (!contentType && /^<(?:!doctype|html|head|body)/i.test(bodyTrimmed)));
+
+  const $ = isHtml ? cheerio.load(httpResult.body) : null;
+
+  // Check redirected final URL and embedded HTML subresources (iframes, scripts, stylesheets, images)
+  // in a single batch call when the initial URL was not directly flagged
   let effectiveWebRiskFindings = webRiskFindings;
-  if (
-    effectiveWebRiskFindings.length === 0 &&
-    httpResult.finalUrl &&
-    httpResult.finalUrl !== normalizedUrl &&
-    Date.now() < deadlineMs - 2500
-  ) {
-    effectiveWebRiskFindings = await runWebRiskCheck(httpResult.finalUrl, {
-      timeoutMs: Math.min(3500, Math.max(500, deadlineMs - Date.now() - 1000)),
-    });
+  if (effectiveWebRiskFindings.length === 0 && Date.now() < deadlineMs - 2000) {
+    const secondaryThreatUrls: string[] = [];
+    if (httpResult.finalUrl && httpResult.finalUrl !== normalizedUrl) {
+      secondaryThreatUrls.push(httpResult.finalUrl);
+    }
+    if ($) {
+      secondaryThreatUrls.push(
+        ...extractSubresourceUrls($, httpResult.finalUrl || normalizedUrl, 25)
+      );
+    }
+    if (secondaryThreatUrls.length > 0) {
+      effectiveWebRiskFindings = await runWebRiskBatchCheck(secondaryThreatUrls, {
+        timeoutMs: Math.min(3500, Math.max(500, deadlineMs - Date.now() - 800)),
+      });
+    }
   }
 
   // Phase 2: Passive HTTP -> HTTPS enforcement check (single non-redirected probe on http://)
@@ -257,16 +280,6 @@ export async function scanWebsite(rawUrl: string): Promise<ScanInternalReport> {
     };
   }
 
-  // Parse HTML once if response looks like HTML
-  const contentType = String(httpResult.headers['content-type'] || '').toLowerCase();
-  const bodyTrimmed = (httpResult.body || '').trimStart();
-  const isHtml =
-    Boolean(httpResult.body) &&
-    (contentType.includes('text/html') ||
-      contentType.includes('application/xhtml+xml') ||
-      (!contentType && /^<(?:!doctype|html|head|body)/i.test(bodyTrimmed)));
-
-  const $ = isHtml ? cheerio.load(httpResult.body) : null;
   const wpSignals = detectWordPressFootprint(httpResult, $);
 
   const ctx: ScanContext = {
