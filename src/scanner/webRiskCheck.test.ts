@@ -301,3 +301,45 @@ test('runWebRiskCheck strips accidental surrounding quotes from API keys', async
     ['Malware Detected']
   );
 });
+
+test('runWebRiskCheck automatically falls back to Safe Browsing API v4 when Web Risk returns 403', async () => {
+  const calledUrls: string[] = [];
+  const mockFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const urlStr = String(input);
+    calledUrls.push(urlStr);
+    if (urlStr.startsWith(WEB_RISK_API_ENDPOINT)) {
+      return new Response(
+        JSON.stringify({
+          error: { code: 403, status: 'PERMISSION_DENIED', message: 'Permission denied on the service.' },
+        }),
+        { status: 403, headers: { 'content-type': 'application/json' } }
+      );
+    }
+    assert.equal(init?.method, 'POST');
+    assert.equal((init?.headers as Record<string, string>)['X-Goog-Api-Key'], 'safe-browsing-key');
+    return new Response(
+      JSON.stringify({
+        matches: [
+          { threatType: 'MALWARE' },
+          { threatType: 'MALWARE' },
+          { threatType: 'SOCIAL_ENGINEERING' },
+        ],
+      }),
+      { status: 200, headers: { 'content-type': 'application/json' } }
+    );
+  }) as typeof fetch;
+
+  const findings = await runWebRiskCheck('https://testsafebrowsing.appspot.com/s/malware.html', {
+    apiKey: 'safe-browsing-key',
+    fetchFn: mockFetch,
+  });
+
+  assert.equal(calledUrls.length, 2);
+  assert.ok(calledUrls[0].startsWith(WEB_RISK_API_ENDPOINT));
+  assert.ok(calledUrls[1].includes('safebrowsing.googleapis.com/v4/threatMatches:find'));
+  assert.deepEqual(
+    findings.map((f) => f.errorName),
+    ['Malware Detected', 'Social Engineering Detected']
+  );
+});
+

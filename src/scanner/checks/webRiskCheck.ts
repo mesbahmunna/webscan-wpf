@@ -82,11 +82,115 @@ export function getWebRiskDiagnostic(): WebRiskDiagnostic {
   };
 }
 
+export const SAFE_BROWSING_API_ENDPOINT =
+  'https://safebrowsing.googleapis.com/v4/threatMatches:find';
+
+interface SafeBrowsingApiResponse {
+  matches?: Array<{
+    threatType?: unknown;
+  }>;
+  error?: {
+    code?: unknown;
+    message?: unknown;
+    status?: unknown;
+  };
+}
+
+function mapThreatTypesToFindings(
+  rawTypes: unknown[],
+  detectionMethod: string,
+  sourceLabel: string
+): ScanCheckResult[] {
+  const seen = new Set<WebRiskThreatType>();
+  const results: ScanCheckResult[] = [];
+
+  for (const entry of rawTypes) {
+    if (typeof entry !== 'string') continue;
+    const normalized = entry.trim().toUpperCase() as WebRiskThreatType;
+    if (!(normalized in WEB_RISK_THREAT_NAME_MAP) || seen.has(normalized)) {
+      continue;
+    }
+    seen.add(normalized);
+    results.push({
+      errorName: WEB_RISK_THREAT_NAME_MAP[normalized],
+      detected: true,
+      evidence: `${sourceLabel} flagged URL for ${normalized}`,
+      detectionMethod,
+      category: 'malware',
+    });
+  }
+
+  return results;
+}
+
+async function querySafeBrowsingFallback(
+  validatedUri: string,
+  apiKey: string,
+  fetchFn: typeof fetch,
+  signal: AbortSignal
+): Promise<{ ok: boolean; status: number; findings: ScanCheckResult[]; detail?: string }> {
+  const response = await fetchFn(SAFE_BROWSING_API_ENDPOINT, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+      'X-Goog-Api-Key': apiKey,
+    },
+    body: JSON.stringify({
+      client: {
+        clientId: 'wordpressfixer-scanner',
+        clientVersion: '1.0.0',
+      },
+      threatInfo: {
+        threatTypes: [...WEB_RISK_THREAT_TYPES],
+        platformTypes: ['ANY_PLATFORM'],
+        threatEntryTypes: ['URL'],
+        threatEntries: [{ url: validatedUri }],
+      },
+    }),
+    signal,
+  });
+
+  if (!response.ok) {
+    let detail = response.statusText || 'Unknown error';
+    try {
+      const errPayload = (await response.json()) as SafeBrowsingApiResponse;
+      if (typeof errPayload?.error?.message === 'string' && errPayload.error.message.trim()) {
+        const statusLabel =
+          typeof errPayload.error.status === 'string' ? `${errPayload.error.status}: ` : '';
+        detail = `${statusLabel}${errPayload.error.message.trim()}`;
+      }
+    } catch {
+      // Ignore non-JSON error bodies
+    }
+    return { ok: false, status: response.status, findings: [], detail };
+  }
+
+  const data = (await response.json()) as SafeBrowsingApiResponse;
+  const rawTypes = Array.isArray(data?.matches)
+    ? data.matches.map((m) => m?.threatType)
+    : [];
+  return {
+    ok: true,
+    status: response.status,
+    findings: mapThreatTypesToFindings(
+      rawTypes,
+      'google-safe-browsing-api',
+      'Google Safe Browsing'
+    ),
+  };
+}
+
+const SAFE_BROWSING_FALLBACK_TTL_MS = 10 * 60 * 1000;
+let preferSafeBrowsingUntil = 0;
+
 /**
  * Queries Google Web Risk Lookup API (v1/uris:search) for MALWARE,
  * SOCIAL_ENGINEERING, and UNWANTED_SOFTWARE.
  *
  * - Keeps the API key strictly on the backend (sent via X-Goog-Api-Key header).
+ * - If Web Risk returns HTTP 403 (e.g., key is enabled for Safe Browsing API v4 instead),
+ *   falls back to Google Safe Browsing Lookup API v4 with the same threat types.
  * - Deduplicates detected threats and returns only clean threat names.
  * - Fails gracefully on missing credentials, timeouts, HTTP errors, or invalid JSON.
  */
@@ -130,6 +234,21 @@ export async function runWebRiskCheck(
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
+    if (isProdRuntimeCall && Date.now() < preferSafeBrowsingUntil) {
+      const sbRes = await querySafeBrowsingFallback(
+        validatedUri,
+        apiKey,
+        fetchFn,
+        controller.signal
+      );
+      if (sbRes.ok) {
+        lastDiagnostic = { lastOutcome: 'ok', lastHttpStatus: sbRes.status };
+        return sbRes.findings;
+      }
+      // Reset preference if Safe Browsing stopped succeeding
+      preferSafeBrowsingUntil = 0;
+    }
+
     const response = await fetchFn(endpoint.toString(), {
       method: 'GET',
       headers: {
@@ -154,6 +273,31 @@ export async function runWebRiskCheck(
         // Ignore non-JSON error bodies
       }
       const detail = errStatus ? `${errStatus}: ${errMessage}` : errMessage;
+
+      if (response.status === 403) {
+        const fallback = await querySafeBrowsingFallback(
+          validatedUri,
+          apiKey,
+          fetchFn,
+          controller.signal
+        );
+        if (fallback.ok) {
+          if (isProdRuntimeCall) {
+            preferSafeBrowsingUntil = Date.now() + SAFE_BROWSING_FALLBACK_TTL_MS;
+            lastDiagnostic = {
+              lastOutcome: 'ok',
+              lastHttpStatus: fallback.status,
+            };
+          }
+          return fallback.findings;
+        }
+        console.warn(
+          `[WebRisk] API returned HTTP 403 (${detail}); Safe Browsing v4 fallback returned HTTP ${fallback.status} (${fallback.detail || 'error'})`
+        );
+      } else {
+        console.warn(`[WebRisk] API returned HTTP ${response.status}: ${detail}`);
+      }
+
       if (isProdRuntimeCall) {
         lastDiagnostic = {
           lastOutcome: 'http-error',
@@ -162,7 +306,6 @@ export async function runWebRiskCheck(
           lastErrorMessage: errMessage,
         };
       }
-      console.warn(`[WebRisk] API returned HTTP ${response.status}: ${detail}`);
       return [];
     }
 
@@ -179,26 +322,7 @@ export async function runWebRiskCheck(
       return [];
     }
 
-    const seen = new Set<WebRiskThreatType>();
-    const results: ScanCheckResult[] = [];
-
-    for (const entry of rawTypes) {
-      if (typeof entry !== 'string') continue;
-      const normalized = entry.trim().toUpperCase() as WebRiskThreatType;
-      if (!(normalized in WEB_RISK_THREAT_NAME_MAP) || seen.has(normalized)) {
-        continue;
-      }
-      seen.add(normalized);
-      results.push({
-        errorName: WEB_RISK_THREAT_NAME_MAP[normalized],
-        detected: true,
-        evidence: `Google Web Risk flagged URL for ${normalized}`,
-        detectionMethod: 'google-web-risk-api',
-        category: 'malware',
-      });
-    }
-
-    return results;
+    return mapThreatTypesToFindings(rawTypes, 'google-web-risk-api', 'Google Web Risk');
   } catch (err) {
     // Graceful fallback: never fail or stall a scan if Web Risk API is unreachable
     const reason = err instanceof Error ? `${err.name}: ${err.message}` : 'Request failed';

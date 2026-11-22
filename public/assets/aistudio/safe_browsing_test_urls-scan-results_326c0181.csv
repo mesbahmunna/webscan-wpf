@@ -1,0 +1,50 @@
+Website,Status,Detected Errors
+https://testsafebrowsing.appspot.com/s/phishing.html,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/malware.html,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/malware_in_iframe.html,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/unwanted.html,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/image_small.html,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/image_medium.html,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/image_large.html,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/image_dynamic.html,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/bad_css.html,Errors Found,White Screen / Blank Page
+https://testsafebrowsing.appspot.com/s/bad_javascript.html,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/trick_to_bill.html,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/content.exe,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/badrep.exe,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/unknown.exe,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/uncommon.zip,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/pua.exe,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/cookie_theft.exe,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/bad_app_file_on_scan.exe,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/zip_password_1234.zip,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/unknown.apk,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/test_apk_ras.apk,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/mimosa_unwanted.apk,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/mimosa_unknown.apk,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/apiv4/IOS/MALWARE/URL/,No Errors Found,No Errors Found
+https://testsafebrowsing.appspot.com/apiv4/IOS/SOCIAL_ENGINEERING_INTERNAL/URL/,No Errors Found,No Errors Found
+https://testsafebrowsing.appspot.com/apiv4/OSX/MALWARE/URL/,No Errors Found,No Errors Found
+https://testsafebrowsing.appspot.com/apiv4/OSX/SOCIAL_ENGINEERING_INTERNAL/URL/,No Errors Found,No Errors Found
+https://testsafebrowsing.appspot.com/s/notif_pageload.html,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/geoloc_click.html,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/notif_geoloc_delay.html,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/media_batch.html,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/midi_click.html,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/bad_login.html,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/low_rep_login.html,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/suspicious.html,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/rt_suspicious_warn.html,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/rt_suspicious_warn_2.html,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/blocklist_suspicious.html,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/force_csd.html,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/local_trigger_csd.html,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/file1.txt,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/file2.txt,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/export_report1.csv,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/restricted_content.html,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/restricted_content_in_iframe.html,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/restricted_content_in_image.html,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/special1.html,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/shortlink.html,Errors Found,HTTP to HTTPS Redirect Missing
+https://testsafebrowsing.appspot.com/s/customer_image.html,Errors Found,HTTP to HTTPS Redirect Missing
