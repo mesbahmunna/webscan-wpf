@@ -1,0 +1,6 @@
+{
+  "name": "WordPressFixer Website Error Scanner",
+  "description": "Scan your website for publicly detectable errors and issues with WordPressFixer.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
